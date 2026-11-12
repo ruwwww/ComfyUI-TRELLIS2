@@ -14,7 +14,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import comfy.ops
+import comfy.quant_ops
+import comfy.model_management
 import comfy.patcher_extension
+from comfy.ldm.flux.math import apply_rope, apply_rope1
 
 from .attention_sparse import scaled_dot_product_attention, sparse_scaled_dot_product_attention, dispatch_varlen_attention
 from .sparse import VarLenTensor, SparseTensor, sparse_cat, get_debug
@@ -25,11 +28,38 @@ ops = comfy.ops.manual_cast
 log = logging.getLogger("trellis2")
 
 
+def _fused_adaln(x: torch.Tensor, norm: nn.Module, scale: torch.Tensor, shift: torch.Tensor) -> torch.Tensor:
+    if (
+        comfy.quant_ops._CK_AVAILABLE
+        and x.is_cuda
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and getattr(norm, "weight", None) is None
+        and not comfy.model_management.in_training
+    ):
+        return comfy.quant_ops.ck.adaln(
+            x,
+            scale.to(dtype=x.dtype, device=x.device),
+            shift.to(dtype=x.dtype, device=x.device),
+            norm.eps,
+        )
+    return torch.addcmul(shift, norm(x), 1 + scale)
+
+
+def _phases_to_freqs_cis(phases: torch.Tensor) -> torch.Tensor:
+    if phases.is_complex():
+        cos = phases.real
+        sin = phases.imag
+        return torch.stack([torch.stack([cos, sin], dim=-1), torch.stack([-sin, cos], dim=-1)], dim=-1)
+    return phases
+
+
 # =============================================================================
 # 1. Utilities (from modules/utils.py and modules/spatial.py)
 # =============================================================================
 
 def str_to_dtype(dtype_str):
+    if dtype_str is None:
+        return torch.bfloat16
     if isinstance(dtype_str, torch.dtype):
         return dtype_str
     return {
@@ -173,10 +203,27 @@ class RotaryPositionEmbedder(nn.Module):
 
     @staticmethod
     def apply_rotary_embedding(x: torch.Tensor, phases: torch.Tensor) -> torch.Tensor:
+        if comfy.quant_ops._CK_AVAILABLE and x.is_cuda and x.ndim == 4:
+            f_cis = _phases_to_freqs_cis(phases).to(device=x.device)
+            if f_cis.ndim == 4:
+                f_cis = f_cis.unsqueeze(0).unsqueeze(2)
+            return apply_rope1(x, f_cis)
         x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
         x_rotated = x_complex * phases.unsqueeze(-2)
         x_embed = torch.view_as_real(x_rotated).reshape(*x_rotated.shape[:-1], -1).to(x.dtype)
         return x_embed
+
+    @staticmethod
+    def apply_rotary_embedding_pair(q: torch.Tensor, k: torch.Tensor, phases: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if comfy.quant_ops._CK_AVAILABLE and q.is_cuda and q.ndim == 4:
+            f_cis = _phases_to_freqs_cis(phases).to(device=q.device)
+            if f_cis.ndim == 4:
+                f_cis = f_cis.unsqueeze(0).unsqueeze(2)
+            return apply_rope(q, k, f_cis)
+        return (
+            RotaryPositionEmbedder.apply_rotary_embedding(q, phases),
+            RotaryPositionEmbedder.apply_rotary_embedding(k, phases),
+        )
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         """
@@ -272,8 +319,7 @@ class MultiHeadAttention(nn.Module):
                         k = self.k_rms_norm(k)
                     if self.use_rope:
                         assert phases is not None, "Phases must be provided for RoPE"
-                        q = RotaryPositionEmbedder.apply_rotary_embedding(q, phases)
-                        k = RotaryPositionEmbedder.apply_rotary_embedding(k, phases)
+                        q, k = RotaryPositionEmbedder.apply_rotary_embedding_pair(q, k, phases)
                     h = scaled_dot_product_attention(q, k, v, transformer_options=transformer_options)
                 else:
                     h = scaled_dot_product_attention(qkv, transformer_options=transformer_options)
@@ -351,8 +397,12 @@ class FeedForwardNet(nn.Module):
             operations.Linear(int(channels * mlp_ratio), channels, dtype=dtype, device=device),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.mlp(x)
+    def forward(self, x: torch.Tensor, residual: Optional[torch.Tensor] = None, residual_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
+        h = self.mlp[0](x)
+        return comfy.ops.linear_input_act(
+            self.mlp[2], h, "gelu_tanh",
+            residual=residual, residual_scale=residual_scale,
+        )
 
 
 class TransformerBlock(nn.Module):
@@ -568,20 +618,19 @@ class ModulatedTransformerBlock(nn.Module):
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.modulation.to(device=mod.device) + mod).type(mod.dtype).chunk(6, dim=1)
         else:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(mod).chunk(6, dim=1)
-        h = self.norm1(x)
-        h = h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+        h = _fused_adaln(x, self.norm1, scale_msa.unsqueeze(1), shift_msa.unsqueeze(1))
         h = self.attn(h, phases=phases, transformer_options=transformer_options)
         if "attn1_output_patch" in transformer_patches:
             patch = transformer_patches["attn1_output_patch"]
             for p in patch:
                 h = p(h, transformer_options)
-        h = h * gate_msa.unsqueeze(1)
-        x = x + h
-        h = self.norm2(x)
-        h = h * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
-        h = self.mlp(h)
-        h = h * gate_mlp.unsqueeze(1)
-        x = x + h
+        x = torch.addcmul(x, h, gate_msa.unsqueeze(1))
+        h = _fused_adaln(x, self.norm2, scale_mlp.unsqueeze(1), shift_mlp.unsqueeze(1))
+        if x.shape[0] == 1 and gate_mlp.shape[0] == 1:
+            x = self.mlp(h, residual=x, residual_scale=gate_mlp.reshape(-1))
+        else:
+            h = self.mlp(h)
+            x = torch.addcmul(x, h, gate_mlp.unsqueeze(1))
         return x
 
     def forward(self, x: torch.Tensor, mod: torch.Tensor, phases: Optional[torch.Tensor] = None, transformer_options={}) -> torch.Tensor:
@@ -669,15 +718,13 @@ class ModulatedTransformerCrossBlock(nn.Module):
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.modulation.to(device=mod.device) + mod).type(mod.dtype).chunk(6, dim=1)
         else:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(mod).chunk(6, dim=1)
-        h = self.norm1(x)
-        h = h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+        h = _fused_adaln(x, self.norm1, scale_msa.unsqueeze(1), shift_msa.unsqueeze(1))
         h = self.self_attn(h, phases=phases, transformer_options=transformer_options)
         if "attn1_output_patch" in transformer_patches:
             patch = transformer_patches["attn1_output_patch"]
             for p in patch:
                 h = p(h, transformer_options)
-        h = h * gate_msa.unsqueeze(1)
-        x = x + h
+        x = torch.addcmul(x, h, gate_msa.unsqueeze(1))
         h = self.norm2(x)
         h = self.cross_attn(h, context, transformer_options=transformer_options)
         if "attn2_output_patch" in transformer_patches:
@@ -685,11 +732,12 @@ class ModulatedTransformerCrossBlock(nn.Module):
             for p in patch:
                 h = p(h, transformer_options)
         x = x + h
-        h = self.norm3(x)
-        h = h * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
-        h = self.mlp(h)
-        h = h * gate_mlp.unsqueeze(1)
-        x = x + h
+        h = _fused_adaln(x, self.norm3, scale_mlp.unsqueeze(1), shift_mlp.unsqueeze(1))
+        if x.shape[0] == 1 and gate_mlp.shape[0] == 1:
+            x = self.mlp(h, residual=x, residual_scale=gate_mlp.reshape(-1))
+        else:
+            h = self.mlp(h)
+            x = torch.addcmul(x, h, gate_mlp.unsqueeze(1))
         return x
 
     def forward(self, x: torch.Tensor, mod: torch.Tensor, context: torch.Tensor, phases: Optional[torch.Tensor] = None, transformer_options={}) -> torch.Tensor:
@@ -743,6 +791,26 @@ class SparseRotaryPositionEmbedder(nn.Module):
             k (SparseTensor): [..., N, H, D] tensor of keys
         """
         assert q.coords.shape[-1] == self.dim + 1, "Last dimension of coords must be equal to dim+1"
+        if comfy.quant_ops._CK_AVAILABLE and q.feats.is_cuda:
+            cis_cache_name = f'rope_cis_{self.dim}d_freq{self.rope_freq[0]}-{self.rope_freq[1]}_hd{self.head_dim}'
+            f_cis = q.get_spatial_cache(cis_cache_name)
+            if f_cis is None:
+                coords = q.coords[..., 1:].float()
+                phases = self._get_phases(coords.reshape(-1)).reshape(*coords.shape[:-1], -1)
+                if phases.shape[-1] < self.head_dim // 2:
+                    padn = self.head_dim // 2 - phases.shape[-1]
+                    phases = torch.cat([phases, torch.polar(
+                        torch.ones(*phases.shape[:-1], padn, device=phases.device),
+                        torch.zeros(*phases.shape[:-1], padn, device=phases.device)
+                    )], dim=-1)
+                f_cis = _phases_to_freqs_cis(phases)
+                q.register_spatial_cache(cis_cache_name, f_cis)
+            f_cis_b = f_cis.unsqueeze(1) if q.feats.ndim == 3 else f_cis
+            if k is None:
+                return q.replace(apply_rope1(q.feats[None], f_cis_b[None])[0])
+            q_feats, k_feats = apply_rope(q.feats[None], k.feats[None], f_cis_b[None])
+            return q.replace(q_feats[0]), k.replace(k_feats[0])
+
         phases_cache_name = f'rope_phase_{self.dim}d_freq{self.rope_freq[0]}-{self.rope_freq[1]}_hd{self.head_dim}'
         phases = q.get_spatial_cache(phases_cache_name)
         if phases is None:
@@ -1082,8 +1150,13 @@ class SparseFeedForwardNet(nn.Module):
             sparse_operations.SparseLinear(int(channels * mlp_ratio), channels, dtype=dtype, device=device),
         )
 
-    def forward(self, x: VarLenTensor) -> VarLenTensor:
-        return self.mlp(x)
+    def forward(self, x: VarLenTensor, residual: Optional[torch.Tensor] = None, residual_scale: Optional[torch.Tensor] = None) -> VarLenTensor:
+        h = self.mlp[0](x)
+        out_feats = comfy.ops.linear_input_act(
+            self.mlp[2], h.feats, "gelu_tanh",
+            residual=residual, residual_scale=residual_scale,
+        )
+        return x.replace(out_feats)
 
 
 class SparseTransformerBlock(nn.Module):
@@ -1307,20 +1380,29 @@ class ModulatedSparseTransformerBlock(nn.Module):
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.modulation.to(device=mod.device) + mod).type(mod.dtype).chunk(6, dim=1)
         else:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(mod).chunk(6, dim=1)
-        h = x.replace(self.norm1(x.feats))
-        h = h * (1 + scale_msa) + shift_msa
-        h = self.attn(h, transformer_options=transformer_options)
+        single_batch = len(x.layout) == 1 and scale_msa.shape[0] == 1
+        b_map = None if single_batch else x.batch_boardcast_map
+        h_feats = _fused_adaln(
+            x.feats, self.norm1,
+            scale_msa if single_batch else scale_msa[b_map],
+            shift_msa if single_batch else shift_msa[b_map],
+        )
+        h = self.attn(x.replace(h_feats), transformer_options=transformer_options)
         if "attn1_output_patch" in transformer_patches:
             patch = transformer_patches["attn1_output_patch"]
             for p in patch:
                 h = p(h, transformer_options)
-        h = h * gate_msa
-        x = x + h
-        h = x.replace(self.norm2(x.feats))
-        h = h * (1 + scale_mlp) + shift_mlp
-        h = self.mlp(h)
-        h = h * gate_mlp
-        x = x + h
+        x = x.replace(torch.addcmul(x.feats, h.feats, gate_msa if single_batch else gate_msa[b_map]))
+        h_feats = _fused_adaln(
+            x.feats, self.norm2,
+            scale_mlp if single_batch else scale_mlp[b_map],
+            shift_mlp if single_batch else shift_mlp[b_map],
+        )
+        if single_batch:
+            x = self.mlp(x.replace(h_feats), residual=x.feats, residual_scale=gate_mlp.reshape(-1))
+        else:
+            h = self.mlp(x.replace(h_feats))
+            x = x.replace(torch.addcmul(x.feats, h.feats, gate_mlp[b_map]))
         return x
 
     def forward(self, x: SparseTensor, mod: torch.Tensor, transformer_options={}) -> SparseTensor:
@@ -1412,15 +1494,19 @@ class ModulatedSparseTransformerCrossBlock(nn.Module):
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.modulation.to(device=mod.device) + mod).type(mod.dtype).chunk(6, dim=1)
         else:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(mod).chunk(6, dim=1)
-        h = x.replace(self.norm1(x.feats))
-        h = h * (1 + scale_msa) + shift_msa
-        h = self.self_attn(h, transformer_options=transformer_options)
+        single_batch = len(x.layout) == 1 and scale_msa.shape[0] == 1
+        b_map = None if single_batch else x.batch_boardcast_map
+        h_feats = _fused_adaln(
+            x.feats, self.norm1,
+            scale_msa if single_batch else scale_msa[b_map],
+            shift_msa if single_batch else shift_msa[b_map],
+        )
+        h = self.self_attn(x.replace(h_feats), transformer_options=transformer_options)
         if "attn1_output_patch" in transformer_patches:
             patch = transformer_patches["attn1_output_patch"]
             for p in patch:
                 h = p(h, transformer_options)
-        h = h * gate_msa
-        x = x + h
+        x = x.replace(torch.addcmul(x.feats, h.feats, gate_msa if single_batch else gate_msa[b_map]))
         h = x.replace(self.norm2(x.feats))
         h = self.cross_attn(h, context, transformer_options=transformer_options)
         if "attn2_output_patch" in transformer_patches:
@@ -1428,11 +1514,16 @@ class ModulatedSparseTransformerCrossBlock(nn.Module):
             for p in patch:
                 h = p(h, transformer_options)
         x = x + h
-        h = x.replace(self.norm3(x.feats))
-        h = h * (1 + scale_mlp) + shift_mlp
-        h = self.mlp(h)
-        h = h * gate_mlp
-        x = x + h
+        h_feats = _fused_adaln(
+            x.feats, self.norm3,
+            scale_mlp if single_batch else scale_mlp[b_map],
+            shift_mlp if single_batch else shift_mlp[b_map],
+        )
+        if single_batch:
+            x = self.mlp(x.replace(h_feats), residual=x.feats, residual_scale=gate_mlp.reshape(-1))
+        else:
+            h = self.mlp(x.replace(h_feats))
+            x = x.replace(torch.addcmul(x.feats, h.feats, gate_mlp[b_map]))
         return x
 
     def forward(self, x: SparseTensor, mod: torch.Tensor, context: Union[torch.Tensor, VarLenTensor], transformer_options={}) -> SparseTensor:

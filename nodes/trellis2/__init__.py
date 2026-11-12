@@ -127,15 +127,36 @@ def from_pretrained(path: str, disk_offload_manager=None, model_key: str = None,
         import comfy.model_management
         device = str(comfy.model_management.get_torch_device())
 
+    sd = comfy.utils.load_torch_file(model_file, device=torch.device(device))
+    quant_config = comfy.utils.detect_layer_quantization(sd, "")
+
     # Build model on meta device (zero memory, no random init)
     model_class = _get_model_class(config['name'])
+    op_kwargs = {}
+    if quant_config:
+        import inspect
+        import comfy.ops
+        from .ops_sparse import mixed_precision_sparse_ops
+        compute_dtype = torch.bfloat16
+        disabled = comfy.ops.get_disabled_quant_formats(torch.device(device))
+        sig = inspect.signature(model_class.__init__)
+        if "operations" in sig.parameters and "operations" not in kwargs:
+            op_kwargs["operations"] = comfy.ops.mixed_precision_ops(
+                quant_config=quant_config, compute_dtype=compute_dtype, disabled=disabled
+            )
+        if "sparse_operations" in sig.parameters and "sparse_operations" not in kwargs:
+            op_kwargs["sparse_operations"] = mixed_precision_sparse_ops(
+                quant_config=quant_config, compute_dtype=compute_dtype, disabled=disabled
+            )
+
     log.info(f"Building model: {config['name']} (meta device)...")
     with torch.device("meta"):
-        model = model_class(**config['args'], **kwargs)
+        model = model_class(**config['args'], **op_kwargs, **kwargs)
     log.info(f"Loading weights directly to {device}...")
-    model.load_state_dict(comfy.utils.load_torch_file(model_file, device=torch.device(device)), strict=False, assign=True)
+    model.load_state_dict(sd, strict=False, assign=True)
+    del sd
     weight_dtype = next(model.parameters()).dtype
-    import sys; print(f"[TRELLIS2] Model {config['name']} loaded: weights={weight_dtype}, device={device}", file=sys.stderr)
+    import sys; print(f"[TRELLIS2] Model {config['name']} loaded: weights={weight_dtype}, quant={bool(quant_config)}, device={device}", file=sys.stderr)
 
     # Reinitialize any buffers left on meta device after assign=True loading
     for name, buf in model.named_buffers():

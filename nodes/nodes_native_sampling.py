@@ -85,6 +85,7 @@ Use Trellis2Empty3DLatent for the initial latent.""",
 
         # Create model config instance
         ss_config = SSConfig(unet_config)
+        ss_config.quant_config = comfy.utils.detect_layer_quantization(sd, "")
 
         # Determine dtype
         device = comfy.model_management.get_torch_device()

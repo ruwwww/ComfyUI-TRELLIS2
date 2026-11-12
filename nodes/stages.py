@@ -213,6 +213,17 @@ def _init_config():
         local_config = os.path.join(models_dir, f"{model_name}.json")
         local_weights = os.path.join(models_dir, f"{model_name}.safetensors")
 
+        # Prefer ConvRot INT8 quantized checkpoint if available locally (unless TRELLIS2_FORCE_BF16=1)
+        if os.environ.get("TRELLIS2_FORCE_BF16", "0") != "1":
+            stem = model_name[:-5] if model_name.endswith("_bf16") else model_name
+            for cand_name in (f"{stem}_int8_convrot", f"{model_name}_int8_convrot"):
+                cand_cfg = os.path.join(models_dir, f"{cand_name}.json")
+                cand_wt = os.path.join(models_dir, f"{cand_name}.safetensors")
+                if os.path.exists(cand_cfg) and os.path.exists(cand_wt):
+                    local_config = cand_cfg
+                    local_weights = cand_wt
+                    break
+
         if os.path.exists(local_config) and os.path.exists(local_weights):
             _model_paths[key] = local_weights
         else:
@@ -226,18 +237,10 @@ def _init_config():
             _model_paths[key] = local_weights
         pbar.update(1)
 
-    # Register shape_slat_encoder (not in pipeline.json but needed for mesh encoding)
+    # Register shape_slat_encoder path (downloaded lazily in _load_model if needed)
     if 'shape_slat_encoder' not in _model_paths:
         encoder_model_name = "ckpts/shape_enc_next_dc_f16c32_fp16"
-        local_config = os.path.join(models_dir, f"{encoder_model_name}.json")
         local_weights = os.path.join(models_dir, f"{encoder_model_name}.safetensors")
-        if not (os.path.exists(local_config) and os.path.exists(local_weights)):
-            from huggingface_hub import hf_hub_download
-            os.makedirs(os.path.dirname(local_config), exist_ok=True)
-            print(f"[TRELLIS2] Downloading {encoder_model_name}...", flush=True)
-            hf_hub_download("microsoft/TRELLIS.2-4B", f"{encoder_model_name}.json", local_dir=models_dir, tqdm_class=_comfy_tqdm())
-            hf_hub_download("microsoft/TRELLIS.2-4B", f"{encoder_model_name}.safetensors", local_dir=models_dir, tqdm_class=_comfy_tqdm())
-            print(f"[TRELLIS2] Downloaded {encoder_model_name}", flush=True)
         _model_paths['shape_slat_encoder'] = local_weights
     pbar.update(1)
 
@@ -253,8 +256,9 @@ def _load_model(model_key, device=None):
     models if VRAM is tight — this fires correctly because _unload_model
     calls unpatch_model() so the patcher is always "off GPU" between uses.
     """
-    import time, sys
+    import inspect, time, sys
     import comfy.model_patcher
+    import comfy.ops
     import comfy.utils
 
     if device is None:
@@ -269,6 +273,15 @@ def _load_model(model_key, device=None):
         safetensors_path = _model_paths[model_key]
         config_path = safetensors_path.replace('.safetensors', '.json')
 
+        if not (os.path.exists(config_path) and os.path.exists(safetensors_path)):
+            from huggingface_hub import hf_hub_download
+            models_dir = _get_trellis2_models_dir()
+            rel_name = os.path.relpath(safetensors_path[:-12], models_dir)
+            os.makedirs(os.path.dirname(config_path), exist_ok=True)
+            print(f"[TRELLIS2] Downloading {rel_name}...", flush=True)
+            hf_hub_download("microsoft/TRELLIS.2-4B", f"{rel_name}.json", local_dir=models_dir, tqdm_class=_comfy_tqdm())
+            hf_hub_download("microsoft/TRELLIS.2-4B", f"{rel_name}.safetensors", local_dir=models_dir, tqdm_class=_comfy_tqdm())
+
         with open(config_path, 'r') as f:
             config = json.load(f)
 
@@ -279,18 +292,34 @@ def _load_model(model_key, device=None):
         sd = comfy.utils.load_torch_file(safetensors_path)
         pbar.update(1)
 
+        quant_config = comfy.utils.detect_layer_quantization(sd, "")
+
         # Determine target dtype: bf16 if GPU supports it, else keep disk dtype
         compute_dtype = comfy.model_management.vae_dtype(device, allowed_dtypes=[torch.bfloat16])
-        weight_dtype = compute_dtype if compute_dtype == torch.bfloat16 else next(iter(sd.values())).dtype
+        weight_dtype = compute_dtype if compute_dtype == torch.bfloat16 else torch.float16
 
-        # Pre-cast state dict to target dtype (single pass, before entering model)
-        if weight_dtype != next(iter(sd.values())).dtype:
-            for k in sd:
-                if sd[k].is_floating_point():
-                    sd[k] = sd[k].to(weight_dtype)
+        # Pre-cast floating-point weights to target dtype (preserve fp32 scales for quantized layers)
+        _SCALE_SUFFIXES = ("weight_scale", "weight_scale_2", "weight_s_channel", "input_scale", "pre_quant_scale")
+        for k in sd:
+            if sd[k].is_floating_point() and not k.endswith(_SCALE_SUFFIXES) and sd[k].dtype != weight_dtype:
+                sd[k] = sd[k].to(weight_dtype)
+
+        op_kwargs = {}
+        if quant_config:
+            from .trellis2.ops_sparse import mixed_precision_sparse_ops
+            disabled = comfy.ops.get_disabled_quant_formats(device)
+            sig = inspect.signature(model_class.__init__)
+            if "operations" in sig.parameters:
+                op_kwargs["operations"] = comfy.ops.mixed_precision_ops(
+                    quant_config=quant_config, compute_dtype=weight_dtype, disabled=disabled
+                )
+            if "sparse_operations" in sig.parameters:
+                op_kwargs["sparse_operations"] = mixed_precision_sparse_ops(
+                    quant_config=quant_config, compute_dtype=weight_dtype, disabled=disabled
+                )
 
         # Build model on CPU — assign=True: sd tensors become parameters directly (no copy)
-        model = model_class(**config['args'])
+        model = model_class(**config['args'], **op_kwargs)
         model.load_state_dict(sd, strict=False, assign=True)
         del sd
 
@@ -305,7 +334,8 @@ def _load_model(model_key, device=None):
         pbar.update(1)
 
         elapsed = time.perf_counter() - t0
-        print(f"[TRELLIS2] Built {config['name']} on CPU: dtype={weight_dtype}, {elapsed:.1f}s", file=sys.stderr)
+        q_tag = f", quant={list(quant_config.keys())}" if quant_config else ""
+        print(f"[TRELLIS2] Built {config['name']} ({os.path.basename(safetensors_path)}) on CPU: dtype={weight_dtype}{q_tag}, {elapsed:.1f}s", file=sys.stderr)
 
     # Always: load to GPU via ComfyUI VRAM management (offloads other models if needed)
     t0 = time.perf_counter()
